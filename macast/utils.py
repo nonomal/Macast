@@ -14,12 +14,18 @@ import cherrypy
 import subprocess
 from enum import Enum
 import netifaces as ni
+
 if sys.platform == 'darwin':
     from AppKit import NSBundle
+elif sys.platform == 'win32':
+    import win32api
+    import win32con
 
 logger = logging.getLogger("Utils")
-DEFAULT_PORT = 1068
+DEFAULT_PORT = 0
 SETTING_DIR = appdirs.user_config_dir('Macast', 'xfangfang')
+PROTOCOL_DIR = 'protocol'
+RENDERER_DIR = 'renderer'
 
 
 class SettingProperty(Enum):
@@ -29,9 +35,10 @@ class SettingProperty(Enum):
     MenubarIcon = 3
     ApplicationPort = 4
     DLNA_FriendlyName = 5
-    DLNA_Renderer = 6
-    Blocked_Interfaces = 7
-    Additional_Interfaces = 8
+    Macast_Renderer = 6
+    Macast_Protocol = 7
+    Blocked_Interfaces = 8
+    Additional_Interfaces = 9
 
 
 class Setting:
@@ -41,6 +48,8 @@ class Setting:
     last_ip = None
     base_path = None
     friendly_name = "Macast({})".format(platform.node())
+    temp_friendly_name = None
+    mpv_default_path = 'mpv'
 
     @staticmethod
     def save():
@@ -75,6 +84,11 @@ class Setting:
         return Setting.setting
 
     @staticmethod
+    def reload():
+        Setting.setting = None
+        Setting.load()
+
+    @staticmethod
     def get_system_version():
         """Get system version
         """
@@ -98,26 +112,27 @@ class Setting:
         This name will show in the device search list of the DLNA client
         and as player window default name.
         """
+        if Setting.temp_friendly_name:
+            return Setting.temp_friendly_name
         return Setting.get(SettingProperty.DLNA_FriendlyName, Setting.friendly_name)
 
     @staticmethod
-    def set_friendly_name(name):
-        """Set application friendly name
-        This name will show in the device search list of the DLNA client
-        and as player window default name.
-        """
-        Setting.friendly_name = name
-        Setting.save()
+    def set_temp_friendly_name(name):
+        Setting.temp_friendly_name = name
 
     @staticmethod
     def get_usn(refresh=False):
-        """Get device Unique identification
+        """Get device unique identification
         """
-        if 'USN' in Setting.setting and not refresh:
-            return Setting.setting['USN']
-        Setting.setting['USN'] = str(uuid.uuid4())
-        Setting.save()
-        return Setting.setting['USN']
+        dlna_id = str(uuid.uuid4())
+        if not refresh:
+            dlna_id_temp = Setting.get(SettingProperty.USN, dlna_id)
+            if dlna_id == dlna_id_temp:
+                Setting.set(SettingProperty.USN, dlna_id)
+            return dlna_id_temp
+        else:
+            Setting.set(SettingProperty.USN, dlna_id)
+            return dlna_id
 
     @staticmethod
     def is_ip_changed():
@@ -184,6 +199,8 @@ class Setting:
     def get(property, default=1):
         """Get application settings
         """
+        if not bool(Setting.setting):
+            Setting.load()
         if property.name in Setting.setting:
             return Setting.setting[property.name]
         Setting.setting[property.name] = default
@@ -237,6 +254,33 @@ class Setting:
                      'tell application "System Events" ' +
                      'to delete login item "{}"'.format(app_name)])
             return res
+        elif sys.platform == 'win32':
+            """Find the path of Macast.exe so as to create shortcut.
+            """
+            if "python" in os.path.basename(sys.executable).lower():
+                return (1, "Not support to set start at login.")
+
+            key = win32api.RegOpenKey(win32con.HKEY_CURRENT_USER,
+                                      r'Software\Microsoft\Windows\CurrentVersion\Run',
+                                      0,
+                                      win32con.KEY_SET_VALUE)
+            logger.info(sys.executable)
+            if launch:
+                try:
+                    win32api.RegSetValueEx(key, 'Macast', 0, win32con.REG_SZ, sys.executable)
+                    win32api.RegCloseKey(key)
+                except Exception as e:
+                    logger.error(e)
+                    # cherrypy.engine.publish("app_notify", "ERROR", f"{e}")
+                return 0, 1
+            else:
+                try:
+                    win32api.RegDeleteValue(key, 'Macast')
+                    win32api.RegCloseKey(key)
+                except Exception as e:
+                    logger.error(e)
+                    # cherrypy.engine.publish("app_notify", "ERROR", f"{e}")
+                return 0, 1
         else:
             return (1, 'Not support current platform.')
 
@@ -298,6 +342,22 @@ class Setting:
                                          cherrypy.engine.states.STARTED,
                                          ]
 
+    @staticmethod
+    def restart():
+        if sys.platform == 'darwin' and sys.executable.endswith("Contents/MacOS/python"):
+            # run from py2app build
+            Setting.stop_service()
+            executable = sys.executable[:-6] + 'Macast'
+            os.execv(executable, [executable, executable])
+        elif sys.platform == 'linux' and getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+            # run from pyinstaller build on linux
+            Setting.stop_service()
+            env = Setting.get_system_env()
+            executable = sys.executable
+            os.execve(executable, [executable, executable], env)
+        else:
+            cherrypy.engine.restart()
+
 
 class XMLPath(Enum):
     BASE_PATH = os.path.dirname(__file__)
@@ -305,11 +365,12 @@ class XMLPath(Enum):
     AV_TRANSPORT = BASE_PATH + '/xml/AVTransport.xml'
     CONNECTION_MANAGER = BASE_PATH + '/xml/ConnectionManager.xml'
     RENDERING_CONTROL = BASE_PATH + '/xml/RenderingControl.xml'
+    SETTING_PAGE = BASE_PATH + '/xml/setting.html'
     PROTOCOL_INFO = BASE_PATH + '/xml/SinkProtocolInfo.csv'
 
 
 def load_xml(path):
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         xml = f.read()
     return xml
 
@@ -317,6 +378,7 @@ def load_xml(path):
 def notify_error(msg=None):
     """publish a notification when error occured
     """
+
     def wrapper_fun(fun):
         def wrapper(*args, **kwargs):
             nonlocal msg
@@ -329,5 +391,40 @@ def notify_error(msg=None):
                 else:
                     logger.error(msg)
                 cherrypy.engine.publish('app_notify', 'Error', msg)
+
         return wrapper
+
     return wrapper_fun
+
+
+def publish_method(func):
+    def wrap(*args, **kwargs):
+        func(*args, **kwargs)
+        cherrypy.engine.publish(func.__name__, *args, **kwargs)
+
+    return wrap
+
+
+def format_class_name(instance):
+    """
+    eg1: DLNAHandler -> DLNA Handler
+    eg2: AabcBabc -> Aabc Babc
+    :param instance:
+    :return:
+    """
+    name = instance.__class__.__name__
+    res = name[0]
+    for i in range(1, len(name) - 1):
+        if 'A' <= name[i] <= 'Z' and 'a' <= name[i + 1] <= 'z':
+            res += f' {name[i]}'
+        else:
+            res += name[i]
+    res += name[-1]
+    return res
+
+
+def cherrypy_publish(method, default=None):
+    res = cherrypy.engine.publish(method)
+    if len(res) > 0:
+        return res.pop()
+    return default
